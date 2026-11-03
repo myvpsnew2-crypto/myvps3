@@ -2,202 +2,106 @@ name: Secure RDP via Tailscale
 
 on:
   workflow_dispatch:
-    inputs:
-      hostname:
-        description: "Tailscale hostname (optional)"
-        required: false
-        default: "gh-rdp"
-      keep_alive_minutes:
-        description: "Kitne minutes runner alive rahe (max ~3600)"
-        required: false
-        default: "120"
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      - name: Enable RDP (with NLA)
+      - name: Enable RDP + Firewall
         shell: pwsh
         run: |
-          # RDP enable karo
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0 -Force
-
-          # Network Level Authentication ON rakho (zyada secure)
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" -Value 1 -Force
-
-          # SecurityLayer = TLS (2) – 0 mat use karo
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "SecurityLayer" -Value 2 -Force
-
-          # Firewall: sirf Tailscale range (100.64.0.0/10) se allow karo
+          # RDP enable
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # NLA OFF (zyada compatible)
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          
+          # Firewall - Remote Desktop group enable karo (sabse reliable)
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Extra rule bhi daal do
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # Service restart
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 5
+          Write-Host "RDP Enabled"
 
-          Write-Host "RDP enabled with NLA + restricted firewall rule"
-
-      - name: Create temporary RDP user
-        id: create-user
+      - name: Create RDP User
+        id: user
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.Security
-
-          $upper   = [char[]](65..90)
-          $lower   = [char[]](97..122)
-          $number  = [char[]](48..57)
-          $special = [char[]](33,35,36,37,38,42,43,45,61,63,64)  # safe special chars
-
-          $raw = @()
-          $raw += $upper   | Get-Random -Count 5
-          $raw += $lower   | Get-Random -Count 5
-          $raw += $number  | Get-Random -Count 4
-          $raw += $special | Get-Random -Count 4
-          $password = -join ($raw | Sort-Object {Get-Random})
-
-          # Password ko logs se hide karo
-          echo "::add-mask::$password"
-
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          # Purana user delete (agar pehle se ho)
+          $pass = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 16 | ForEach-Object {[char]$_})
+          echo "::add-mask::$pass"
+          
+          $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+          
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name "RDP" -Confirm:$false
           }
-
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          
+          New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "password=$pass" >> $env:GITHUB_OUTPUT
+          Write-Host "User RDP created"
 
-          # Output password (sirf is step ke liye)
-          echo "password=$password" >> $env:GITHUB_OUTPUT
-          echo "RDP user created successfully"
-
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $ProgressPreference = "SilentlyContinue"
-          $msi = "$env:TEMP\tailscale.msi"
-
-          # Latest stable MSI download
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $msi -UseBasicParsing
-
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-          Remove-Item $msi -Force -ErrorAction SilentlyContinue
-
-          # Path confirm
-          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
-            throw "Tailscale installation failed"
-          }
-          Write-Host "Tailscale installed"
-
-      - name: Connect to Tailscale
-        id: tailscale
+      - name: Install & Connect Tailscale
+        id: ts
         shell: pwsh
         env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $hostname = "${{ github.event.inputs.hostname }}"
-          if ([string]::IsNullOrWhiteSpace($hostname)) {
-            $hostname = "gh-rdp-$env:GITHUB_RUN_ID"
-          }
+          $ProgressPreference = "SilentlyContinue"
+          $msi = "$env:TEMP\ts.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Remove-Item $msi -Force
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=$env:TS_AUTHKEY `
-            --hostname=$hostname `
-            --accept-routes `
-            --accept-dns=false
-
-          # IP aane ka wait
+          $hostname = "gh-rdp-$env:GITHUB_RUN_ID"
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TS_KEY --hostname=$hostname --accept-dns=false
+          
+          # IP wait
           $ip = $null
-          for ($i = 1; $i -le 15; $i++) {
-            Start-Sleep -Seconds 4
+          for ($i=1; $i -le 20; $i++) {
+            Start-Sleep 3
             $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-            if ($ip -and $ip -match "^\d+\.\d+\.\d+\.\d+$") { break }
-            Write-Host "Waiting for Tailscale IP... ($i/15)"
+            if ($ip -match "^\d+\.\d+\.\d+\.\d+$") { break }
+            Write-Host "Waiting for IP... $i"
           }
-
-          if (-not $ip) {
-            throw "Tailscale IP assign nahi hua"
-          }
-
+          
+          if (-not $ip) { throw "Tailscale IP nahi mila" }
+          
           echo "ip=$ip" >> $env:GITHUB_OUTPUT
           echo "hostname=$hostname" >> $env:GITHUB_OUTPUT
-          Write-Host "Connected → $ip ($hostname)"
+          Write-Host "Tailscale IP: $ip"
 
-      - name: Verify RDP port
+      - name: Show Details + Keep Alive
         shell: pwsh
         run: |
-          $ip = "${{ steps.tailscale.outputs.ip }}"
-          $result = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
-
-          if (-not $result.TcpTestSucceeded) {
-            throw "Port 3389 reachable nahi hai"
-          }
-          Write-Host "RDP port 3389 OK"
-
-      - name: Show connection details
-        shell: pwsh
-        run: |
-          $ip       = "${{ steps.tailscale.outputs.ip }}"
-          $hostname = "${{ steps.tailscale.outputs.hostname }}"
-          $password = "${{ steps.create-user.outputs.password }}"
-
-          $info = @"
-          ### RDP Access Ready
-
-          | Field       | Value                  |
-          |-------------|------------------------|
-          | **Address** | ``$ip``                |
-          | **Hostname**| ``$hostname``          |
-          | **Username**| ``RDP``                |
-          | **Password**| ``$password``          |
-
-          **RDP Client mein connect karo:**
-          - Address: $ip
-          - Username: RDP
-          - Password: (upar wala)
-
-          > Note: Ye runner tab tak alive rahega jab tak aap workflow cancel nahi karte.
-          "@
-
-          # Console pe bhi dikhao
-          Write-Host "`n========================================"
-          Write-Host "  RDP ACCESS DETAILS"
-          Write-Host "========================================"
+          $ip = "${{ steps.ts.outputs.ip }}"
+          $pass = "${{ steps.user.outputs.password }}"
+          
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "  RDP READY"
+          Write-Host "=============================================="
           Write-Host "Address  : $ip"
-          Write-Host "Hostname : $hostname"
           Write-Host "Username : RDP"
-          Write-Host "Password : $password"
-          Write-Host "========================================`n"
-
-          # GitHub Summary mein bhi
-          $info | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
-
-      - name: Keep runner alive
-        shell: pwsh
-        run: |
-          $minutes = [int]"${{ github.event.inputs.keep_alive_minutes }}"
-          if ($minutes -lt 5) { $minutes = 5 }
-          if ($minutes -gt 3500) { $minutes = 3500 }
-
-          $endTime = (Get-Date).AddMinutes($minutes)
-          Write-Host "Runner alive rahega approximately $minutes minutes tak..."
-          Write-Host "End time: $endTime"
-          Write-Host "Cancel karne ke liye workflow ko manually cancel karo.`n"
-
-          while ((Get-Date) -lt $endTime) {
-            $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Still alive • Remaining ~$remaining min"
-            Start-Sleep -Seconds 300
+          Write-Host "Password : $pass"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Apne PC pe Tailscale connected hona chahiye!"
+          Write-Host "Phir mstsc mein $ip daal ke connect karo."
+          Write-Host ""
+          
+          # 2 hours alive
+          $end = (Get-Date).AddMinutes(120)
+          while ((Get-Date) -lt $end) {
+            Write-Host "[$(Get-Date -Format HH:mm:ss)] Alive..."
+            Start-Sleep 300
           }
-
-          Write-Host "Time up. Runner stop ho raha hai."
